@@ -1,4 +1,8 @@
-use std::{collections::BTreeMap, error::Error};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    error::Error,
+    fmt::Display,
+};
 
 use lopdf::{Document, Object, Stream};
 
@@ -21,6 +25,31 @@ impl Font {
             return result;
         }
         Document::decode_text(Some(self.encoding.as_str()), text)
+    }
+}
+
+#[derive(PartialEq, Eq, Clone)]
+struct TextChunk {
+    text: String,
+    x: i32,
+    y: i32,
+}
+
+impl PartialOrd for TextChunk {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for TextChunk {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.y.cmp(&other.y).then_with(|| self.x.cmp(&other.x))
+    }
+}
+
+impl Display for TextChunk {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.text.fmt(f)
     }
 }
 
@@ -52,11 +81,13 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
     }
 
-    let mut current_font_id = None;
+    let mut text_chunks = Vec::new();
 
     for (page_number, page_id) in document.get_pages() {
-        let mut in_text = false;
+        let mut current_font_id = None;
 
+        let mut in_text = false;
+        let mut current_text = String::new();
         let mut x = 0;
         let mut y = 0;
 
@@ -67,7 +98,15 @@ fn main() -> Result<(), Box<dyn Error>> {
         {
             match operation.operator.as_str() {
                 "BT" => in_text = true,
-                "ET" => in_text = false,
+                "ET" => {
+                    in_text = false;
+                    text_chunks.push(TextChunk {
+                        text: current_text,
+                        x,
+                        y,
+                    });
+                    current_text = String::new();
+                }
                 "Tf" => {
                     let font_id = operation.operands[0].as_name().unwrap();
                     current_font_id = Some(font_id.to_owned());
@@ -75,7 +114,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                 "Tj" if in_text => {
                     let text = operation.operands[0].as_str().unwrap();
                     let font = fonts.get(current_font_id.as_ref().unwrap()).unwrap();
-                    print!("{}", font.decode(text));
+                    current_text.push_str(&font.decode(text));
                 }
                 "Tm" => {
                     // The matrix is 3x2, where the first two rows give us scaling and stuff, and the third one gives us the position.
@@ -95,19 +134,91 @@ fn main() -> Result<(), Box<dyn Error>> {
                             operation.operands[5]
                         ),
                     };
-                    if new_y > y {
-                        println!();
-                    }
                     x = new_x;
                     y = new_y;
                 }
-                //_ if in_text => println!("{:?}", operation.operator.as_str()),
                 _ => {}
             }
         }
     }
 
+    let text_chunks = merge_text_rows(&text_chunks);
+
+    // When doing superscripts, the general pattern is that the y position moves upwards rather than downwards.
+    // We manipulate this to try to find the superscript offset, which we assume is the most common of these.
+    let mut upward_offsets = BTreeMap::new();
+    let mut previous_y = 0;
+    for text_chunk in text_chunks.iter().skip(1) {
+        let offset = text_chunk.y - previous_y;
+        // We are only interested in negative offsets, which mean that it moved upwards.
+        if offset < 0 {
+            *upward_offsets.entry(-offset).or_insert(0) += 1;
+        }
+        previous_y = text_chunk.y;
+    }
+    let (&superscript_offset, _) = upward_offsets
+        .iter()
+        .max_by_key(|(_, &count)| count)
+        .expect("No superscript offset");
+    println!("Superscript offset: {}", superscript_offset);
+    // We assume that if the difference between consecutive chunks is less than or equal to the superscript offset, it is probably a superscript or subscript.
+    let mut new_text_chunks = Vec::new();
+    let mut last_y = 0;
+    let mut last_x = 0;
+    for text_chunk in text_chunks {
+        if text_chunk.x < last_x {
+            // If the x position is less than the last x position, we assume it is a new line.
+            last_x = text_chunk.x;
+            last_y = text_chunk.y;
+            new_text_chunks.push(text_chunk);
+            continue;
+        }
+        if (text_chunk.y - last_y).abs() == superscript_offset {
+            // If the difference is negative, it is a superscript.
+            let html_tag_name = if text_chunk.y - last_y > 0 {
+                "sub"
+            } else {
+                "sup"
+            };
+            last_x = text_chunk.x;
+            new_text_chunks.push(TextChunk {
+                text: format!("<{}>{}</{}>", html_tag_name, text_chunk.text, html_tag_name),
+                x: text_chunk.x,
+                y: last_y,
+            });
+        } else {
+            last_x = text_chunk.x;
+            last_y = text_chunk.y;
+            new_text_chunks.push(text_chunk);
+        }
+    }
+
+    let text_chunks = merge_text_rows(&new_text_chunks);
+
+    for text_chunk in text_chunks {
+        println!("{}", text_chunk);
+    }
+
     Ok(())
+}
+
+fn merge_text_rows(text_chunks: &[TextChunk]) -> Vec<TextChunk> {
+    let mut merged_text_chunks = Vec::new();
+    let mut last_text_chunk: Option<TextChunk> = None;
+    for text_chunk in text_chunks {
+        if let Some(last_text_chunk) = last_text_chunk.as_mut() {
+            if last_text_chunk.y == text_chunk.y {
+                last_text_chunk.text.push_str(&text_chunk.text);
+                continue;
+            }
+            merged_text_chunks.push(last_text_chunk.clone());
+        }
+        last_text_chunk = Some(text_chunk.clone());
+    }
+    if let Some(last_text_chunk) = last_text_chunk {
+        merged_text_chunks.push(last_text_chunk);
+    }
+    merged_text_chunks
 }
 
 fn parse_unicode_map(unicode_map: &Stream) -> BTreeMap<u32, u32> {
