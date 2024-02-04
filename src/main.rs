@@ -173,13 +173,10 @@ fn main() -> Result<(), Box<dyn Error>> {
             new_text_chunks.push(text_chunk);
             continue;
         }
-        if (text_chunk.y - last_y).abs() == superscript_offset {
+        let offset = text_chunk.y - last_y;
+        if offset.abs() <= superscript_offset && offset != 0 {
             // If the difference is negative, it is a superscript.
-            let html_tag_name = if text_chunk.y - last_y > 0 {
-                "sub"
-            } else {
-                "sup"
-            };
+            let html_tag_name = if offset > 0 { "sub" } else { "sup" };
             last_x = text_chunk.x;
             new_text_chunks.push(TextChunk {
                 text: format!("<{}>{}</{}>", html_tag_name, text_chunk.text, html_tag_name),
